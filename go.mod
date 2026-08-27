@@ -1,4 +1,4 @@
-module github.com/dimmkirr/nixoci
+module github.com/devcell-sh/go-nixoci
 
 go 1.26.0
 

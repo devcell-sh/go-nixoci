@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dimmkirr/nixoci"
+	nixoci "github.com/devcell-sh/go-nixoci"
 )
 
 func TestParseSize(t *testing.T) {

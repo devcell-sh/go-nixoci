@@ -36,7 +36,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/dimmkirr/nixoci"
+	nixoci "github.com/devcell-sh/go-nixoci"
 
 	"github.com/google/go-containerregistry/pkg/crane"
 	"github.com/google/go-containerregistry/pkg/name"

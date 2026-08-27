@@ -7,5 +7,5 @@ It talks to registries through `go-containerregistry` directly rather than shell
 nixoci is used by [devcell](https://github.com/DimmKirr/devcell) to cache container Nix volumes between CI runs. The API is `Push`, `Pull`, and `ResolveImage`; pin a version if you build on it.
 
 ```sh
-go get github.com/dimmkirr/nixoci
+go get github.com/devcell-sh/go-nixoci
 ```

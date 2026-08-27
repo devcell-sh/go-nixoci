@@ -6,7 +6,7 @@ import (
 	"net/url"
 	"testing"
 
-	"github.com/dimmkirr/nixoci"
+	nixoci "github.com/devcell-sh/go-nixoci"
 
 	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/google/go-containerregistry/pkg/registry"
