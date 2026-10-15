@@ -61,6 +61,11 @@ func ParseSize(s string) (int64, error) {
 // Returns the last error if all attempts fail. Respects context
 // cancellation between attempts.
 func WithRetry(ctx context.Context, maxAttempts int, fn func() error) error {
+	return withRetry(ctx, "[nix-store push]", maxAttempts, fn)
+}
+
+// withRetry is WithRetry with a caller-supplied log prefix.
+func withRetry(ctx context.Context, label string, maxAttempts int, fn func() error) error {
 	if maxAttempts <= 0 {
 		maxAttempts = 1
 	}
@@ -77,8 +82,8 @@ func WithRetry(ctx context.Context, maxAttempts int, fn func() error) error {
 				return ctx.Err()
 			}
 			delay := time.Duration(attempt) * RetryBaseDelay
-			progressLog("[nix-store push] attempt %d/%d failed: %v — retrying in %s\n",
-				attempt, maxAttempts, lastErr, delay.Round(time.Second))
+			progressLog("%s attempt %d/%d failed: %v — retrying in %s\n",
+				label, attempt, maxAttempts, lastErr, delay.Round(time.Second))
 
 			select {
 			case <-ctx.Done():
