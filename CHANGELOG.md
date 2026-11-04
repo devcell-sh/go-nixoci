@@ -11,6 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- docs(changelog): add CHANGELOG.md covering v0.1.0 through v0.3.1 — gives users and integrators a single place to see what changed per release without visiting GitHub
+
+## [0.3.0] - 2026-11-04
+
+### Added
+
 - feat(push): pre-compress chunks to disk and HEAD-check blob digests before upload — re-pushing unchanged content skips blobs already in the registry instead of re-uploading the full store every time
 - feat(push): expose ChunkBytes and UploadJobs on PushOpts — callers can tune chunk size and upload concurrency per push instead of only via package-level vars
 - test(push): add repeat-push test asserting skipped blobs are reported in progress output
@@ -48,6 +54,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - feat(resolve): resolve nix store paths from installable expressions via `nix path-info`
 
 [Unreleased]: https://github.com/devcell-sh/go-nixoci/compare/v0.3.1...HEAD
-[0.3.1]: https://github.com/devcell-sh/go-nixoci/compare/v0.2.0...v0.3.1
+[0.3.1]: https://github.com/devcell-sh/go-nixoci/compare/v0.3.0...v0.3.1
+[0.3.0]: https://github.com/devcell-sh/go-nixoci/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/devcell-sh/go-nixoci/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/devcell-sh/go-nixoci/commits/v0.1.0
