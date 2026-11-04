@@ -9,6 +9,7 @@ import (
 	"os"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"compress/gzip"
@@ -194,6 +195,8 @@ func fmtBytes(n uint64) string {
 // When ChunkSize <= 0, the original single-layer streaming behavior
 // is preserved: bytes flow r → gzip → registry with no disk staging.
 func Push(ctx context.Context, baseRef, dstRef string, r io.ReadCloser) error {
+	TotalSizeHint = 0
+
 	dst, err := name.ParseReference(dstRef)
 	if err != nil {
 		return fmt.Errorf("parse dst %q: %w", dstRef, err)
@@ -339,16 +342,36 @@ func Push(ctx context.Context, baseRef, dstRef string, r io.ReadCloser) error {
 		defer r.Close()
 		tr := tar.NewReader(r)
 
-		// Phase 1: split tar into temp files on disk.
+		// Check available disk space before starting. We need room for
+		// compressed .gz chunks (~45% of input) plus one uncompressed
+		// chunk in flight at a time (~ChunkSize).
+		if avail, err := availableDiskSpace(os.TempDir()); err == nil {
+			estimated := int64(float64(TotalSizeHint)*0.50) + ChunkSize
+			progressLog("[nix-store push] disk: %s available in %s, estimated need %s\n",
+				fmtBytes(uint64(avail)), os.TempDir(), fmtBytes(uint64(estimated)))
+			if avail < estimated {
+				return fmt.Errorf("insufficient disk space in %s: %s available, need ~%s (compressed chunks + 1 in-flight)",
+					os.TempDir(), fmtBytes(uint64(avail)), fmtBytes(uint64(estimated)))
+			}
+		}
+
+		// Split tar into chunks, compressing each immediately after split
+		// so the uncompressed temp file can be deleted. This keeps peak
+		// disk at ~1 chunk (512 MB) + all .gz files (~45% of input)
+		// instead of 2× input.
 		splitStart := time.Now()
-		var chunkFiles []string
+		dstRepo := dst.Context()
+		var layers []v1.Layer
+		var gzFiles []string
 		defer func() {
-			for _, f := range chunkFiles {
-				os.Remove(f)
+			for _, gf := range gzFiles {
+				os.Remove(gf)
 			}
 		}()
 
 		var splitBytes int64
+		var totalCompressed int64
+		var skippedChunks int
 		for chunkIdx := 0; ; chunkIdx++ {
 			tmpFile, err := os.CreateTemp("", fmt.Sprintf("nix-chunk-%03d-", chunkIdx))
 			if err != nil {
@@ -362,7 +385,7 @@ func Push(ctx context.Context, baseRef, dstRef string, r io.ReadCloser) error {
 
 			n, copyErr := io.Copy(tmpFile, pr)
 			tmpFile.Close()
-			chunkElapsed := time.Since(chunkStart)
+			splitElapsed := time.Since(chunkStart)
 
 			if copyErr != nil {
 				os.Remove(tmpFile.Name())
@@ -371,7 +394,7 @@ func Push(ctx context.Context, baseRef, dstRef string, r io.ReadCloser) error {
 			}
 
 			splitBytes += n
-			chunkFiles = append(chunkFiles, tmpFile.Name())
+			hasMore := <-more
 
 			var pctInfo string
 			if TotalSizeHint > 0 {
@@ -379,71 +402,61 @@ func Push(ctx context.Context, baseRef, dstRef string, r io.ReadCloser) error {
 				pctInfo = fmt.Sprintf(" — %.0f%% of %s", pct, fmtBytes(uint64(TotalSizeHint)))
 			}
 			var speedInfo string
-			if chunkElapsed.Seconds() > 0.1 {
-				speedInfo = fmt.Sprintf(" at %.0f MB/s", float64(n)/chunkElapsed.Seconds()/(1<<20))
+			if splitElapsed.Seconds() > 0.1 {
+				speedInfo = fmt.Sprintf(" at %.0f MB/s", float64(n)/splitElapsed.Seconds()/(1<<20))
 			}
 			progressLog("[nix-store push] chunk %d split (%s in %s%s%s)\n",
-				chunkIdx+1, fmtBytes(uint64(n)), chunkElapsed.Round(time.Millisecond), speedInfo, pctInfo)
+				chunkIdx+1, fmtBytes(uint64(n)), splitElapsed.Round(time.Millisecond), speedInfo, pctInfo)
 
-			if !(<-more) {
-				break
-			}
-		}
-
-		var totalFileBytes int64
-		for _, cf := range chunkFiles {
-			if fi, err := os.Stat(cf); err == nil {
-				totalFileBytes += fi.Size()
-			}
-		}
-		TotalSizeHint = totalFileBytes
-		progressLog("[nix-store push] %d chunks (%s) split in %s, uploading with %d parallel streams\n",
-			len(chunkFiles), fmtBytes(uint64(totalFileBytes)), time.Since(splitStart).Round(time.Millisecond), UploadJobs)
-
-		// Phase 2: pre-compress chunks to get digests, check registry
-		// for existing blobs, then upload only new ones.
-		start = time.Now()
-		uploading.Store(true)
-
-		tracker := &chunkTracker{total: int32(len(chunkFiles))}
-		trackerPtr.Store(tracker)
-
-		dstRepo := dst.Context()
-		var layers []v1.Layer
-		var gzFiles []string
-		defer func() {
-			for _, gf := range gzFiles {
-				os.Remove(gf)
-			}
-		}()
-
-		var skippedChunks int
-		for i, chunkFile := range chunkFiles {
-			gzPath, compressedHash, diffIDHash, compressedSize, err := preCompressChunk(chunkFile)
-			if err != nil {
-				return fmt.Errorf("pre-compress chunk %d: %w", i+1, err)
+			// Compress immediately, then delete the uncompressed file.
+			compressStart := time.Now()
+			gzPath, compressedHash, diffIDHash, compressedSize, compErr := preCompressChunk(tmpFile.Name())
+			os.Remove(tmpFile.Name())
+			if compErr != nil {
+				return fmt.Errorf("pre-compress chunk %d: %w", chunkIdx+1, compErr)
 			}
 			gzFiles = append(gzFiles, gzPath)
+			totalCompressed += compressedSize
+			compressElapsed := time.Since(compressStart)
 
+			status := "new"
 			if blobExistsInRegistry(dstRepo, compressedHash, transport, remoteOpts) {
-				progressLog("[nix-store push] chunk %d skipped (blob sha256:%s… already in registry)\n", i+1, compressedHash[:12])
+				status = "exists"
 				skippedChunks++
 			}
+			progressLog("[nix-store push] chunk %d compressed (%s → %s in %s, sha256:%s… %s)\n",
+				chunkIdx+1, fmtBytes(uint64(n)), fmtBytes(uint64(compressedSize)),
+				compressElapsed.Round(time.Millisecond), compressedHash[:12], status)
 
-			layer := &preDigestedLayer{
+			layers = append(layers, &preDigestedLayer{
 				gzPath:         gzPath,
 				compressedHash: compressedHash,
 				diffIDHash:     diffIDHash,
 				compressedSize: compressedSize,
 				count:          &byteCount,
-				tracker:        tracker,
+				tracker:        nil,
+			})
+
+			if !hasMore {
+				break
 			}
-			layers = append(layers, layer)
 		}
 
-		if skippedChunks > 0 {
-			progressLog("[nix-store push] %d/%d chunks skipped (already in registry)\n", skippedChunks, len(chunkFiles))
+		progressLog("[nix-store push] %d chunks split+compressed in %s (%s → %s, %.0f%% ratio, %d already in registry)\n",
+			len(layers), time.Since(splitStart).Round(time.Millisecond),
+			fmtBytes(uint64(splitBytes)), fmtBytes(uint64(totalCompressed)),
+			float64(totalCompressed)/float64(splitBytes)*100, skippedChunks)
+
+		// Set up upload tracking.
+		start = time.Now()
+		uploading.Store(true)
+		tracker := &chunkTracker{total: int32(len(layers))}
+		trackerPtr.Store(tracker)
+		for _, l := range layers {
+			l.(*preDigestedLayer).tracker = tracker
 		}
+
+		TotalSizeHint = totalCompressed
 
 		progressLog("[nix-store push] building image from %d layers...\n", len(layers))
 		buildStart := time.Now()
@@ -612,6 +625,15 @@ func preCompressChunk(uncompressedPath string) (gzPath, compressedHash, diffIDHa
 	out.Close()
 
 	return gzPath, hex.EncodeToString(compressedHasher.Sum(nil)), hex.EncodeToString(diffIDHasher.Sum(nil)), compressedSize, nil
+}
+
+// availableDiskSpace returns the free bytes on the filesystem containing path.
+func availableDiskSpace(path string) (int64, error) {
+	var stat syscall.Statfs_t
+	if err := syscall.Statfs(path, &stat); err != nil {
+		return 0, err
+	}
+	return int64(stat.Bavail) * int64(stat.Bsize), nil
 }
 
 // preDigestedLayer implements v1.Layer with a pre-computed digest from a

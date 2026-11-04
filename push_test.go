@@ -631,8 +631,8 @@ func TestPush_SkipsBlobUploadOnRepush(t *testing.T) {
 	}
 
 	out := buf.String()
-	if !strings.Contains(out, "skipped") {
-		t.Errorf("expected second push to report skipped blobs, got:\n%s", out)
+	if !strings.Contains(out, "exists") && !strings.Contains(out, "skipped") {
+		t.Errorf("expected second push to report existing blobs, got:\n%s", out)
 	}
 }
 
