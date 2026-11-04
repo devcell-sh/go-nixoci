@@ -18,9 +18,11 @@ var RetryBaseDelay = 15 * time.Second
 
 // PushOpts configures PushFromVolume behavior.
 type PushOpts struct {
-	TagAlias string // create alias tag after push via docker buildx imagetools create
-	Retries  int    // total push attempts (0 or 1 = single attempt, no retry)
-	MinSize  int64  // skip push if volume content < MinSize bytes (0 = always push)
+	TagAlias   string // create alias tag after push via docker buildx imagetools create
+	Retries    int    // total push attempts (0 or 1 = single attempt, no retry)
+	MinSize    int64  // skip push if volume content < MinSize bytes (0 = always push)
+	ChunkBytes int64  // uncompressed tar chunk size in bytes; 0 = use package default (512 MB)
+	UploadJobs int    // concurrent blob upload streams; 0 = use package default (6)
 }
 
 // ParseSize parses a human-readable size string (e.g. "1GB", "500MB",
@@ -111,6 +113,13 @@ func PushFromVolume(ctx context.Context, volume, baseRef, dstRef string, opts Pu
 	}
 
 	TotalSizeHint = sizeBytes
+	if opts.ChunkBytes > 0 {
+		ChunkSize = opts.ChunkBytes
+	}
+	if opts.UploadJobs > 0 {
+		UploadJobs = opts.UploadJobs
+	}
+
 	sizeGB := float64(sizeBytes) / (1 << 30)
 	compressedGB := sizeGB * 0.45
 	progressLog("[nix-store push] volume %s: %.1f GB uncompressed, estimated ~%.1f GB compressed\n",

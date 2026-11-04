@@ -40,9 +40,9 @@ var ProgressTick = 5 * time.Second
 var ChunkSize int64 = 512 << 20 // 512 MB
 
 // UploadJobs controls how many OCI layer blobs are uploaded concurrently
-// by remote.Write. Higher values improve throughput but risk GHCR
-// throttling; 16 caused session kills, 4 is a safe default.
-var UploadJobs = 4
+// by remote.Write. GHCR allows ~2k req/min with a 10-min per-layer
+// timeout; 4-8 is the safe range, above 8 risks 429s.
+var UploadJobs = 6
 
 // StallTimeout is the maximum duration Push tolerates zero byte
 // progress before aborting the upload. Set to 0 to disable. GHCR
