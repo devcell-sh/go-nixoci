@@ -11,6 +11,10 @@ import (
 	"sync/atomic"
 	"time"
 
+	"compress/gzip"
+	"crypto/sha256"
+	"encoding/hex"
+
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
@@ -396,31 +400,49 @@ func Push(ctx context.Context, baseRef, dstRef string, r io.ReadCloser) error {
 		progressLog("[nix-store push] %d chunks (%s) split in %s, uploading with %d parallel streams\n",
 			len(chunkFiles), fmtBytes(uint64(totalFileBytes)), time.Since(splitStart).Round(time.Millisecond), UploadJobs)
 
-		// Phase 2: open all chunk files, wrap in layers, one remote.Write.
+		// Phase 2: pre-compress chunks to get digests, check registry
+		// for existing blobs, then upload only new ones.
 		start = time.Now()
 		uploading.Store(true)
 
 		tracker := &chunkTracker{total: int32(len(chunkFiles))}
 		trackerPtr.Store(tracker)
 
+		dstRepo := dst.Context()
 		var layers []v1.Layer
-		var openFiles []*os.File
+		var gzFiles []string
 		defer func() {
-			for _, f := range openFiles {
-				f.Close()
+			for _, gf := range gzFiles {
+				os.Remove(gf)
 			}
 		}()
 
-		for _, chunkFile := range chunkFiles {
-			f, err := os.Open(chunkFile)
+		var skippedChunks int
+		for i, chunkFile := range chunkFiles {
+			gzPath, compressedHash, diffIDHash, compressedSize, err := preCompressChunk(chunkFile)
 			if err != nil {
-				return fmt.Errorf("open chunk: %w", err)
+				return fmt.Errorf("pre-compress chunk %d: %w", i+1, err)
 			}
-			openFiles = append(openFiles, f)
+			gzFiles = append(gzFiles, gzPath)
 
-			chunkPR := &progressReader{rc: f, count: &byteCount, tracker: tracker}
-			layer := stream.NewLayer(chunkPR, stream.WithMediaType(types.OCILayer))
+			if blobExistsInRegistry(dstRepo, compressedHash, transport, remoteOpts) {
+				progressLog("[nix-store push] chunk %d skipped (blob sha256:%s… already in registry)\n", i+1, compressedHash[:12])
+				skippedChunks++
+			}
+
+			layer := &preDigestedLayer{
+				gzPath:         gzPath,
+				compressedHash: compressedHash,
+				diffIDHash:     diffIDHash,
+				compressedSize: compressedSize,
+				count:          &byteCount,
+				tracker:        tracker,
+			}
 			layers = append(layers, layer)
+		}
+
+		if skippedChunks > 0 {
+			progressLog("[nix-store push] %d/%d chunks skipped (already in registry)\n", skippedChunks, len(chunkFiles))
 		}
 
 		progressLog("[nix-store push] building image from %d layers...\n", len(layers))
@@ -522,4 +544,133 @@ func writeOneChunk(tr *tar.Reader, pw *io.PipeWriter, chunkSize int64, more chan
 			return
 		}
 	}
+}
+
+// blobExistsInRegistry does a HEAD /v2/<repo>/blobs/sha256:<digest> check
+// using the given transport (which carries auth and logging).
+func blobExistsInRegistry(repo name.Repository, digest string, transport http.RoundTripper, _ []remote.Option) bool {
+	u := fmt.Sprintf("%s://%s/v2/%s/blobs/sha256:%s", repo.Registry.Scheme(), repo.RegistryStr(), repo.RepositoryStr(), digest)
+	req, err := http.NewRequest("HEAD", u, nil)
+	if err != nil {
+		return false
+	}
+	resp, err := transport.RoundTrip(req)
+	if err != nil {
+		return false
+	}
+	resp.Body.Close()
+	return resp.StatusCode == http.StatusOK
+}
+
+// preCompressChunk gzips an uncompressed tar chunk file to a temp .gz file
+// and returns the path, compressed sha256 hex digest, uncompressed sha256
+// (DiffID), and compressed size.
+func preCompressChunk(uncompressedPath string) (gzPath, compressedHash, diffIDHash string, compressedSize int64, err error) {
+	in, err := os.Open(uncompressedPath)
+	if err != nil {
+		return "", "", "", 0, err
+	}
+	defer in.Close()
+
+	out, err := os.CreateTemp("", "nix-chunk-gz-*")
+	if err != nil {
+		return "", "", "", 0, err
+	}
+	gzPath = out.Name()
+
+	compressedHasher := sha256.New()
+	diffIDHasher := sha256.New()
+	mw := io.MultiWriter(out, compressedHasher)
+
+	gz, err := gzip.NewWriterLevel(mw, gzip.BestSpeed)
+	if err != nil {
+		out.Close()
+		os.Remove(gzPath)
+		return "", "", "", 0, err
+	}
+
+	tee := io.TeeReader(in, diffIDHasher)
+	if _, err := io.Copy(gz, tee); err != nil {
+		gz.Close()
+		out.Close()
+		os.Remove(gzPath)
+		return "", "", "", 0, err
+	}
+	if err := gz.Close(); err != nil {
+		out.Close()
+		os.Remove(gzPath)
+		return "", "", "", 0, err
+	}
+
+	fi, err := out.Stat()
+	if err != nil {
+		out.Close()
+		os.Remove(gzPath)
+		return "", "", "", 0, err
+	}
+	compressedSize = fi.Size()
+	out.Close()
+
+	return gzPath, hex.EncodeToString(compressedHasher.Sum(nil)), hex.EncodeToString(diffIDHasher.Sum(nil)), compressedSize, nil
+}
+
+// preDigestedLayer implements v1.Layer with a pre-computed digest from a
+// compressed .gz file on disk. This lets remote.Write HEAD-check the
+// registry before uploading and skip blobs that already exist.
+type preDigestedLayer struct {
+	gzPath         string
+	compressedHash string
+	diffIDHash     string
+	compressedSize int64
+	count          *atomic.Uint64
+	tracker        *chunkTracker
+}
+
+func (l *preDigestedLayer) Digest() (v1.Hash, error) {
+	return v1.Hash{Algorithm: "sha256", Hex: l.compressedHash}, nil
+}
+
+func (l *preDigestedLayer) DiffID() (v1.Hash, error) {
+	return v1.Hash{Algorithm: "sha256", Hex: l.diffIDHash}, nil
+}
+
+func (l *preDigestedLayer) Size() (int64, error) {
+	return l.compressedSize, nil
+}
+
+func (l *preDigestedLayer) MediaType() (types.MediaType, error) {
+	return types.OCILayer, nil
+}
+
+func (l *preDigestedLayer) Compressed() (io.ReadCloser, error) {
+	f, err := os.Open(l.gzPath)
+	if err != nil {
+		return nil, err
+	}
+	pr := &progressReader{rc: f, count: l.count, tracker: l.tracker}
+	return pr, nil
+}
+
+func (l *preDigestedLayer) Uncompressed() (io.ReadCloser, error) {
+	f, err := os.Open(l.gzPath)
+	if err != nil {
+		return nil, err
+	}
+	gz, err := gzip.NewReader(f)
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	return &gzReadCloser{gz: gz, f: f}, nil
+}
+
+type gzReadCloser struct {
+	gz *gzip.Reader
+	f  *os.File
+}
+
+func (r *gzReadCloser) Read(p []byte) (int, error) { return r.gz.Read(p) }
+func (r *gzReadCloser) Close() error {
+	r.gz.Close()
+	return r.f.Close()
 }

@@ -588,6 +588,54 @@ func TestPush_ChunkedLayersAreSingleGzipped(t *testing.T) {
 	}
 }
 
+// TestPush_SkipsBlobUploadOnRepush pushes the same content twice and
+// asserts that the second push skips blob uploads for layers the
+// registry already has. This is the dedup test: today every push
+// re-uploads all ~9 GB because stream.NewLayer can't pre-check
+// digests. The fix: pre-compress chunks on disk, HEAD-check blobs,
+// skip known ones.
+func TestPush_SkipsBlobUploadOnRepush(t *testing.T) {
+	srv := newRegistryForPush(t)
+	defer srv.Close()
+
+	regHost := mustHostForPush(t, srv.URL)
+	baseRef := regHost + "/base:latest"
+	dstRef := regHost + "/cache:dedup"
+
+	mustSeedEmptyBase(t, baseRef)
+
+	prevChunk := nixoci.ChunkSize
+	nixoci.ChunkSize = 512
+	defer func() { nixoci.ChunkSize = prevChunk }()
+
+	fixture := map[string][]byte{
+		"nix/store/aaa-pkg/bin/cmd":       bytes.Repeat([]byte("A"), 600),
+		"nix/store/bbb-pkg/lib/libfoo.so": bytes.Repeat([]byte("B"), 600),
+		"nix/store/ccc-pkg/share/data":    bytes.Repeat([]byte("C"), 600),
+	}
+	tarBytes := mustBuildTar(t, fixture)
+
+	// First push: uploads everything.
+	if err := nixoci.Push(context.Background(), baseRef, dstRef, io.NopCloser(bytes.NewReader(tarBytes))); err != nil {
+		t.Fatalf("first Push failed: %v", err)
+	}
+
+	// Second push: identical content. Capture progress output.
+	buf := &syncBuffer{}
+	prevWriter := nixoci.ProgressWriter
+	nixoci.ProgressWriter = buf
+	defer func() { nixoci.ProgressWriter = prevWriter }()
+
+	if err := nixoci.Push(context.Background(), baseRef, dstRef, io.NopCloser(bytes.NewReader(tarBytes))); err != nil {
+		t.Fatalf("second Push failed: %v", err)
+	}
+
+	out := buf.String()
+	if !strings.Contains(out, "skipped") {
+		t.Errorf("expected second push to report skipped blobs, got:\n%s", out)
+	}
+}
+
 // re-use sha256Hex from pull_test.go (same package). Declaration to
 // silence unused-import warnings:
 var _ = sha256.New
