@@ -7,11 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.3.1] - 2026-11-04
+## [0.4.0] - 2026-11-04
 
 ### Added
 
-- docs(changelog): add CHANGELOG.md covering v0.1.0 through v0.3.1 — gives users and integrators a single place to see what changed per release without visiting GitHub
+- feat(push): check available disk space before splitting and fail fast with a clear error if there isn't enough room — large pushes no longer die partway through with "no space left on device"
+- docs(changelog): add CHANGELOG.md covering v0.1.0 through v0.4.0 — gives users and integrators a single place to see what changed per release without visiting GitHub
+
+### Fixed
+
+- fix(push): reset TotalSizeHint at the start of each Push call — repeated pushes in the same process no longer show progress percentages carried over from a previous push
+
+### Changed
+
+- perf(push): interleave chunk splitting with compression, deleting each uncompressed temp file immediately after compressing it — peak disk usage drops from ~2x the store size to one chunk plus the compressed total
+- test(push): loosen repeat-push assertion to match the updated "new"/"exists" compression status wording
 
 ## [0.3.0] - 2026-11-04
 
@@ -53,8 +63,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - feat(pull): PullToDockerVolume streams layers directly into a named Docker volume via alpine container
 - feat(resolve): resolve nix store paths from installable expressions via `nix path-info`
 
-[Unreleased]: https://github.com/devcell-sh/go-nixoci/compare/v0.3.1...HEAD
-[0.3.1]: https://github.com/devcell-sh/go-nixoci/compare/v0.3.0...v0.3.1
+[Unreleased]: https://github.com/devcell-sh/go-nixoci/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/devcell-sh/go-nixoci/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/devcell-sh/go-nixoci/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/devcell-sh/go-nixoci/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/devcell-sh/go-nixoci/commits/v0.1.0
